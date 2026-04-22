@@ -10,6 +10,7 @@ Endpoints:
   POST /query   — retrieve relevant chunks and return a grounded answer
 """
 
+import asyncio
 import hashlib
 import os
 import tempfile
@@ -143,7 +144,8 @@ def _chunk(text: str, size: int = 500, overlap: int = 50) -> List[str]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    _init_db()
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _init_db)
     yield
 
 
