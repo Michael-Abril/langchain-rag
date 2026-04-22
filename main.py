@@ -1,27 +1,27 @@
 """
 LangChain RAG API — FastAPI app for document ingestion and Q&A.
 
-Uses feature-hashing for embeddings (pure numpy, no ML model download),
-pgvector for vector storage, and Anthropic Claude for answer generation.
+Uses feature-hashing for embeddings (pure Python, no ML model download),
+pgvector for vector storage, and an optional LLM for answer generation.
 
 Endpoints:
-  GET  /health  — liveness check
-  POST /upload  — ingest a PDF or text file into the knowledge base
-  POST /query   — retrieve relevant chunks and return a grounded answer
+  GET  /          — root / health check
+  GET  /health    — liveness check
+  POST /upload    — ingest a text file into the knowledge base
+  POST /query     — retrieve relevant chunks and return a grounded answer
 """
 
 import asyncio
 import hashlib
+import math
 import os
-import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import List
 
-import numpy as np
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 
@@ -38,21 +38,23 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
 
 
 # ---------------------------------------------------------------------------
-# Embedding — feature hashing (no model download, O(words) per document)
+# Embedding — feature hashing (pure Python, zero external dependencies)
 # ---------------------------------------------------------------------------
 
 def _embed(texts: List[str]) -> List[List[float]]:
     """Return L2-normalised 384-dim feature-hash embeddings for each text."""
     results = []
     for text in texts:
-        vec = np.zeros(EMBED_DIM)
+        vec = [0.0] * EMBED_DIM
         for word in text.lower().split():
             h = int(hashlib.sha256(word.encode()).hexdigest(), 16)
             idx = h % EMBED_DIM
-            sign = 1 if (h >> 8) & 1 else -1
+            sign = 1.0 if (h >> 8) & 1 else -1.0
             vec[idx] += sign
-        norm = np.linalg.norm(vec)
-        results.append((vec / norm if norm > 0 else vec).tolist())
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        results.append(vec)
     return results
 
 
@@ -69,7 +71,7 @@ def _get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def _init_db(retries: int = 8, delay: float = 4.0):
+def _init_db(retries: int = 15, delay: float = 2.0):
     """Create the pgvector table, retrying while postgres starts up."""
     last_err = None
     for attempt in range(retries):
@@ -92,7 +94,7 @@ def _init_db(retries: int = 8, delay: float = 4.0):
             last_err = exc
             if attempt < retries - 1:
                 time.sleep(delay)
-    print(f"Warning: DB init failed: {last_err}")
+    print(f"Warning: DB init failed after {retries} attempts: {last_err}")
 
 
 def _insert_chunks(filename: str, chunks: List[str], embeddings: List[List[float]]):
@@ -144,7 +146,7 @@ def _chunk(text: str, size: int = 500, overlap: int = 50) -> List[str]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _init_db)
     yield
 
@@ -173,33 +175,25 @@ class QueryRequest(BaseModel):
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Ingest a PDF or plain-text file into the vector knowledge base."""
+    """Ingest a plain-text file into the vector knowledge base."""
     raw = await file.read()
     filename = file.filename or "document.txt"
     suffix = os.path.splitext(filename)[1].lower() or ".txt"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
+    if suffix == ".pdf":
+        raise HTTPException(
+            status_code=415,
+            detail="PDF uploads require pypdf. Upload a plain-text (.txt) file instead.",
+        )
 
-    try:
-        if suffix == ".pdf":
-            import pypdf
-            reader = pypdf.PdfReader(tmp_path)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        else:
-            text = raw.decode("utf-8", errors="replace")
+    text = raw.decode("utf-8", errors="replace")
+    chunks = _chunk(text)
+    if not chunks:
+        return {"status": "ok", "chunks_stored": 0, "filename": filename}
 
-        chunks = _chunk(text)
-        if not chunks:
-            return {"status": "ok", "chunks_stored": 0, "filename": filename}
-
-        embeddings = _embed(chunks)
-        _insert_chunks(filename, chunks, embeddings)
-
-        return {"status": "ok", "chunks_stored": len(chunks), "filename": filename}
-    finally:
-        os.unlink(tmp_path)
+    embeddings = _embed(chunks)
+    _insert_chunks(filename, chunks, embeddings)
+    return {"status": "ok", "chunks_stored": len(chunks), "filename": filename}
 
 
 @app.post("/query")
