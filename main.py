@@ -20,6 +20,11 @@ from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 
 
+def _vec_str(v: List[float]) -> str:
+    """Format a float list as a PostgreSQL vector literal, e.g. '[0.1,0.2,...]'."""
+    return "[" + ",".join(f"{x:.8f}" for x in v) + "]"
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -77,14 +82,15 @@ def _insert_chunks(chunks: List[dict]):
     with conn, conn.cursor() as cur:
         for chunk in chunks:
             cur.execute(
-                f"INSERT INTO {COLLECTION_NAME} (content, metadata, embedding) VALUES (%s, %s, %s)",
-                (chunk["content"], psycopg2.extras.Json(chunk["metadata"]), chunk["embedding"]),
+                f"INSERT INTO {COLLECTION_NAME} (content, metadata, embedding) VALUES (%s, %s, %s::vector)",
+                (chunk["content"], psycopg2.extras.Json(chunk["metadata"]), _vec_str(chunk["embedding"])),
             )
     conn.close()
 
 
 def _search(query_embedding: List[float], k: int = 4) -> List[dict]:
     """Return the k most similar chunks by cosine distance."""
+    vec = _vec_str(query_embedding)
     conn = _get_conn()
     with conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute(
@@ -95,7 +101,7 @@ def _search(query_embedding: List[float], k: int = 4) -> List[dict]:
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,
-            (query_embedding, query_embedding, k),
+            (vec, vec, k),
         )
         rows = [dict(r) for r in cur.fetchall()]
     conn.close()
