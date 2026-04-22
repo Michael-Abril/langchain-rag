@@ -9,11 +9,13 @@ Endpoints:
 """
 
 import os
-import re
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from typing import List
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 
@@ -22,63 +24,119 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------------------------
 
-_RAW_DB_URL = os.getenv("DATABASE_URL", "postgresql://varity:varity@localhost:5432/app")
-
-def _sqlalchemy_url(url: str) -> str:
-    """Ensure the URL uses the postgresql+psycopg2:// scheme for SQLAlchemy."""
-    return re.sub(r"^postgresql://", "postgresql+psycopg2://", url)
-
-DB_URL = _sqlalchemy_url(_RAW_DB_URL)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://varity:varity@localhost:5432/app")
 COLLECTION_NAME = "rag_documents"
 
-# LLM config — uses Anthropic Claude (configurable via env)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
 
-# Embedding model (fastembed — no torch required, ~60 MB download on first use)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 
 # ---------------------------------------------------------------------------
-# Lazy singletons
+# DB helpers
 # ---------------------------------------------------------------------------
 
-_embeddings = None
-_vector_store = None
+def _get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 
-def _get_embeddings():
-    global _embeddings
-    if _embeddings is None:
-        from langchain_community.embeddings import FastEmbedEmbeddings
-        _embeddings = FastEmbedEmbeddings(model_name=EMBED_MODEL)
-    return _embeddings
-
-
-def _get_vector_store(retries: int = 5, delay: float = 3.0):
-    global _vector_store
-    if _vector_store is not None:
-        return _vector_store
-
-    from langchain_community.vectorstores import PGVector
-
+def _init_db(retries: int = 8, delay: float = 4.0):
+    """Create the embeddings table (with retry for container startup lag)."""
     last_err = None
     for attempt in range(retries):
         try:
-            vs = PGVector(
-                connection_string=DB_URL,
-                embedding_function=_get_embeddings(),
-                collection_name=COLLECTION_NAME,
-                pre_delete_collection=False,
-            )
-            _vector_store = vs
-            return vs
+            conn = _get_conn()
+            with conn, conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {COLLECTION_NAME} (
+                        id SERIAL PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        metadata JSONB,
+                        embedding vector(384)
+                    )
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {COLLECTION_NAME}_embedding_idx
+                    ON {COLLECTION_NAME} USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                """)
+            conn.close()
+            return
         except Exception as exc:
             last_err = exc
             if attempt < retries - 1:
                 time.sleep(delay)
+    print(f"Warning: DB init failed after {retries} attempts: {last_err}")
 
-    raise RuntimeError(f"Could not connect to database after {retries} attempts: {last_err}")
+
+def _insert_chunks(chunks: List[dict]):
+    """Insert text chunks with embeddings into the table."""
+    conn = _get_conn()
+    with conn, conn.cursor() as cur:
+        for chunk in chunks:
+            cur.execute(
+                f"INSERT INTO {COLLECTION_NAME} (content, metadata, embedding) VALUES (%s, %s, %s)",
+                (chunk["content"], psycopg2.extras.Json(chunk["metadata"]), chunk["embedding"]),
+            )
+    conn.close()
+
+
+def _search(query_embedding: List[float], k: int = 4) -> List[dict]:
+    """Return the k most similar chunks by cosine distance."""
+    conn = _get_conn()
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT content, metadata,
+                   1 - (embedding <=> %s::vector) AS similarity
+            FROM {COLLECTION_NAME}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (query_embedding, query_embedding, k),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (lazy singleton)
+# ---------------------------------------------------------------------------
+
+_embed_model = None
+
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from fastembed import TextEmbedding
+        _embed_model = TextEmbedding(model_name=EMBED_MODEL)
+    return _embed_model
+
+
+def _embed(texts: List[str]) -> List[List[float]]:
+    model = _get_embed_model()
+    return [emb.tolist() for emb in model.embed(texts)]
+
+
+# ---------------------------------------------------------------------------
+# Text splitting
+# ---------------------------------------------------------------------------
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Simple sliding-window chunker — no langchain dependency needed."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +145,7 @@ def _get_vector_store(retries: int = 5, delay: float = 3.0):
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    try:
-        _get_vector_store()
-        print("Vector store initialised")
-    except Exception as exc:
-        print(f"Warning: vector store not ready at startup — {exc}")
+    _init_db()
     yield
 
 
@@ -124,17 +178,25 @@ async def upload_document(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
-        from langchain_community.document_loaders import PyPDFLoader, TextLoader
+        if suffix == ".pdf":
+            import pypdf
+            reader = pypdf.PdfReader(tmp_path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        else:
+            text = content.decode("utf-8", errors="replace")
 
-        loader = PyPDFLoader(tmp_path) if suffix == ".pdf" else TextLoader(tmp_path, encoding="utf-8")
-        docs = loader.load()
+        raw_chunks = _chunk_text(text)
+        embeddings = _embed(raw_chunks)
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_documents(docs)
-
-        vs = _get_vector_store()
-        vs.add_documents(chunks)
+        chunks = [
+            {
+                "content": raw_chunks[i],
+                "metadata": {"source": filename, "chunk": i},
+                "embedding": embeddings[i],
+            }
+            for i in range(len(raw_chunks))
+        ]
+        _insert_chunks(chunks)
 
         return {"status": "ok", "chunks_stored": len(chunks), "filename": filename}
     finally:
@@ -144,37 +206,37 @@ async def upload_document(file: UploadFile = File(...)):
 @app.post("/query")
 def query_documents(req: QueryRequest):
     """Retrieve relevant chunks and generate a grounded answer."""
-    vs = _get_vector_store()
-    docs = vs.similarity_search(req.question, k=req.k)
+    [query_embedding] = _embed([req.question])
+    results = _search(query_embedding, k=req.k)
 
-    if not docs:
+    if not results:
         return {"answer": "No relevant documents found in the knowledge base.", "sources": []}
 
-    context = "\n\n---\n\n".join(doc.page_content for doc in docs)
+    context = "\n\n---\n\n".join(r["content"] for r in results)
 
     if ANTHROPIC_API_KEY:
-        from langchain_anthropic import ChatAnthropic
-
-        llm = ChatAnthropic(
+        from anthropic import Anthropic
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
             model=ANTHROPIC_MODEL,
-            api_key=ANTHROPIC_API_KEY,
             max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Use only the context below to answer the question. "
+                    "If the answer is not in the context, say so.\n\n"
+                    f"Context:\n{context}\n\nQuestion: {req.question}"
+                ),
+            }],
         )
-        prompt = (
-            "Use only the context below to answer the question. "
-            "If the answer is not in the context, say so.\n\n"
-            f"Context:\n{context}\n\nQuestion: {req.question}\n\nAnswer:"
-        )
-        response = llm.invoke(prompt)
-        answer = response.content
+        answer = message.content[0].text
     else:
-        # Extractive fallback when no LLM is configured
-        answer = docs[0].page_content
+        answer = results[0]["content"]
 
     return {
         "answer": answer,
         "sources": [
-            {"content": doc.page_content[:200], "metadata": doc.metadata}
-            for doc in docs
+            {"content": r["content"][:200], "metadata": r["metadata"], "similarity": r["similarity"]}
+            for r in results
         ],
     }
