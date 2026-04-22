@@ -156,6 +156,11 @@ app = FastAPI(title="LangChain RAG API", version="1.0.0", lifespan=lifespan)
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "langchain-rag", "docs": "/docs"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "langchain-rag"}
